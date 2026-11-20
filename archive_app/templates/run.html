@@ -11,8 +11,10 @@
       <form method="post" action="{{ url_for('run_collect', run_id=run['id']) }}">
         <button type="submit">采集 / 重试</button>
       </form>
-      {% if ready %}
+      {% if downloadable %}
       <a class="button" href="{{ url_for('download_run', run_id=run['id']) }}">下载完整目录</a>
+      {% elif manifest_meta and diff and diff.has_differences %}
+      <span class="button disabled" title="清单与归档存在差异，修正一致后才可下载">下载完整目录（清单不一致）</span>
       {% else %}
       <span class="button disabled" title="所有日期查全或补档成功后才可下载">下载完整目录</span>
       {% endif %}
@@ -28,12 +30,114 @@
     {% endfor %}
   </div>
 
-  {% if ready %}
+  {% if manifest_meta and diff and diff.has_differences %}
+  <p class="banner warn">清单与归档存在差异：漏项 {{ diff.missing | length }}、多项 {{ diff.extra | length }}、错日 {{ diff.wrong_day | length }}。目录下载已暂停，请分批修正。</p>
+  {% elif manifest_meta %}
+  <p class="banner ok">清单与归档完全一致，{{ '可下载完整目录。' if downloadable else '待全部日期查全或补档后可下载。' }}</p>
+  {% elif ready %}
   <p class="banner ok">全部日期已查全或补档成功，可下载完整目录。</p>
   {% else %}
   <p class="banner">逐日进度如下。请求失败的日期会在“采集 / 重试”时重试；已查全与待补档的日期不会重复请求。</p>
   {% endif %}
 </section>
+
+<section class="card">
+  <h2>台网签发事件清单</h2>
+  {% if manifest_meta %}
+  <p class="muted">
+    已登记 {{ manifest_meta['filename'] or '清单文件' }} · {{ manifest_meta['registered_at'] }}
+    · 清单已固定，不可替换
+    · <a href="{{ url_for('download_manifest', run_id=run['id']) }}">下载清单</a>
+  </p>
+  {% else %}
+  <p class="muted">全部日期查全后，可登记一份固定的清单 CSV（每行：唯一事件编号、应归属 UTC 日）。未列出的日期按零条核对，清单登记后不可替换。</p>
+  <form method="post" enctype="multipart/form-data"
+        action="{{ url_for('register_manifest', run_id=run['id']) }}" class="upload">
+    <input type="file" name="csv" accept=".csv,text/csv" required>
+    <button type="submit" {{ 'disabled' if not ready else '' }}>登记清单</button>
+  </form>
+  {% if not ready %}<p class="muted">还有日期未查全或未补档，暂时不能登记清单。</p>{% endif %}
+  {% endif %}
+</section>
+
+{% if diff %}
+<section class="card">
+  <h2>清单差异</h2>
+  <div class="stats">
+    <div class="stat"><span class="num">{{ diff.missing | length }}</span><span class="lbl">漏项（清单有、归档无）</span></div>
+    <div class="stat"><span class="num">{{ diff.extra | length }}</span><span class="lbl">多项（归档有、清单无）</span></div>
+    <div class="stat"><span class="num">{{ diff.wrong_day | length }}</span><span class="lbl">错日（编号在，归属日不对）</span></div>
+  </div>
+
+  {% if diff.missing %}
+  <h3>漏项</h3>
+  <ul class="diff-list">
+    {% for event_id, day in diff.missing %}
+    <li><code>{{ event_id }}</code> 应归属 {{ day }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if diff.extra %}
+  <h3>多项</h3>
+  <ul class="diff-list">
+    {% for event_id, day in diff.extra %}
+    <li><code>{{ event_id }}</code> 归档在 {{ day }}，清单未列出</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if diff.wrong_day %}
+  <h3>错日</h3>
+  <ul class="diff-list">
+    {% for event_id, actual_day, expected_day in diff.wrong_day %}
+    <li><code>{{ event_id }}</code> 实存 {{ actual_day }} → 应归属 {{ expected_day }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if not diff.has_differences %}
+  <p class="muted">没有差异。</p>
+  {% else %}
+  <h3>按日核对</h3>
+  <table class="days">
+    <thead><tr><th>UTC 日期</th><th>清单条数</th><th>归档条数</th><th>漏项</th><th>多项</th></tr></thead>
+    <tbody>
+      {% for row in diff.per_day %}
+      {% if row.has_difference %}
+      <tr>
+        <td>{{ row.day }}</td>
+        <td>{{ row.expected_count }}</td>
+        <td>{{ row.actual_count }}</td>
+        <td>{% if row.missing_ids %}<span class="err">{{ row.missing_ids | join(', ') }}</span>{% else %}—{% endif %}</td>
+        <td>{% if row.extra_ids %}<span class="err">{{ row.extra_ids | join(', ') }}</span>{% else %}—{% endif %}</td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <form method="post" enctype="multipart/form-data"
+        action="{{ url_for('apply_corrections', run_id=run['id']) }}" class="correction">
+    <p class="muted">勾选有差异的日期，上传这些日期修正后的完整事件 CSV（原三列：事件编号、UTC 发震时刻、震级）。零事件日也须勾选，可用只有表头的文件清空。错日事件须在同一批同时勾选原日与应归属日。</p>
+    <div class="day-picker">
+      {% for row in diff.per_day %}
+      {% if row.has_difference %}
+      <label class="check">
+        <input type="checkbox" name="days" value="{{ row.day }}">
+        {{ row.day }}（清单 {{ row.expected_count }} / 实存 {{ row.actual_count }}）
+      </label>
+      {% endif %}
+      {% endfor %}
+    </div>
+    <div class="upload">
+      <input type="file" name="csv" accept=".csv,text/csv" required>
+      <button type="submit">上传所选日期的修正文件</button>
+    </div>
+  </form>
+  {% endif %}
+</section>
+{% endif %}
 
 <section class="card">
   <h2>逐日进度</h2>

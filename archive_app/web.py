@@ -28,7 +28,14 @@ from .catalog import (
     source_from_env,
 )
 from .collector import collect
-from .csv_import import CsvValidationError, parse_csv, verify_includes_collected
+from .csv_import import (
+    CsvValidationError,
+    parse_correction_csv,
+    parse_csv,
+    parse_manifest,
+    verify_correction_batch,
+    verify_includes_collected,
+)
 
 STATUS_LABELS = {
     STATUS_PENDING: "待查询",
@@ -106,6 +113,8 @@ def create_app(
         counts = {status: 0 for status in STATUS_LABELS}
         for row in days:
             counts[row["status"]] = counts.get(row["status"], 0) + 1
+        manifest_meta = st.manifest_meta(run_id)
+        diff = st.diff(run_id)
         return render_template(
             "run.html",
             run=run,
@@ -113,7 +122,124 @@ def create_app(
             counts=counts,
             labels=STATUS_LABELS,
             ready=st.is_ready(run_id),
+            downloadable=st.is_downloadable(run_id),
+            manifest_meta=manifest_meta,
+            diff=diff,
             events=st.events(run_id),
+        )
+
+    def _read_upload(field: str):
+        upload = request.files.get(field)
+        if upload is None or not upload.filename:
+            return None
+        return upload
+
+    @app.post("/runs/<int:run_id>/manifest")
+    def register_manifest(run_id: int):
+        st: Store = current_store()
+        run = st.get_run(run_id)
+        if run is None:
+            abort(404)
+        upload = _read_upload("csv")
+        if upload is None:
+            flash("请选择清单 CSV 文件", "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+        data = upload.read()
+        try:
+            manifest = parse_manifest(data, run["start_date"], run["end_date"])
+            text = data.decode("utf-8-sig", errors="replace")
+            st.set_manifest(run_id, text, manifest, upload.filename)
+        except CsvValidationError as exc:
+            flash("清单校验失败，未做任何变更：" + "；".join(exc.errors), "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+        except ValueError as exc:
+            flash(f"清单登记失败，未做任何变更：{exc}", "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+
+        diff = st.diff(run_id)
+        if diff and diff.has_differences:
+            flash(
+                f"已登记清单（{len(manifest)} 条）。存在差异，目录下载已暂停，"
+                "请勾选有差异的日期并上传修正后的完整事件 CSV。",
+                "warn",
+            )
+        else:
+            flash(f"已登记清单（{len(manifest)} 条），与归档完全一致。", "info")
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.post("/runs/<int:run_id>/corrections")
+    def apply_corrections(run_id: int):
+        st: Store = current_store()
+        run = st.get_run(run_id)
+        if run is None:
+            abort(404)
+        manifest = st.manifest(run_id)
+        if manifest is None:
+            flash("请先登记事件清单", "warn")
+            return redirect(url_for("run_detail", run_id=run_id))
+
+        selected = [
+            value
+            for value in request.form.getlist("days")
+            if any(row["day"] == value for row in st.days(run_id))
+        ]
+        if not selected:
+            flash("请勾选要修正的日期", "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+
+        upload = _read_upload("csv")
+        if upload is None:
+            flash("请选择修正后的完整事件 CSV 文件", "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+
+        collected = st.collected_by_day(run_id)
+        try:
+            parsed = parse_correction_csv(upload.read(), selected, manifest, collected)
+            diff = st.diff(run_id)
+            if diff is None:  # pragma: no cover - checked above
+                raise ValueError("清单尚未登记")
+            verify_correction_batch(selected, diff)
+            st.apply_corrections(run_id, parsed)
+        except CsvValidationError as exc:
+            flash("修正文件校验失败，归档保持不变：" + "；".join(exc.errors), "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+        except KeyError:
+            flash("所选日期不在任务内，归档保持不变", "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+        except ValueError as exc:
+            flash(f"修正失败，归档保持不变：{exc}", "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+
+        remaining = st.diff(run_id)
+        if remaining and remaining.has_differences:
+            flash(
+                f"已修正 {len(selected)} 个日期，仍有差异，下载继续暂停。",
+                "warn",
+            )
+        else:
+            flash(f"已修正 {len(selected)} 个日期，清单与归档完全一致。", "info")
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.get("/runs/<int:run_id>/manifest.csv")
+    def download_manifest(run_id: int):
+        st: Store = current_store()
+        if st.get_run(run_id) is None:
+            abort(404)
+        manifest = st.manifest(run_id)
+        if manifest is None:
+            abort(404)
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(["event_id", "day"])
+        for event_id, day in sorted(manifest.items(), key=lambda item: (item[1], item[0])):
+            writer.writerow([event_id, day])
+        return Response(
+            buffer.getvalue(),
+            mimetype="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="manifest_run{run_id}.csv"',
+                "Cache-Control": "no-store",
+            },
         )
 
     @app.post("/runs/<int:run_id>/collect")
@@ -174,13 +300,12 @@ def create_app(
     @app.get("/runs/<int:run_id>/download")
     def download_run(run_id: int):
         st: Store = current_store()
-        run = st.get_run(run_id)
+        run, allowed, events = st.snapshot_for_download(run_id)
         if run is None:
             abort(404)
-        if not st.is_ready(run_id):
-            flash("还有未查全或未补档的日期，暂不能下载完整目录", "error")
+        if not allowed:
+            flash("还有未查全、未补档或与清单不一致的日期，暂不能下载完整目录", "error")
             return redirect(url_for("run_detail", run_id=run_id))
-        events = st.events(run_id)
         buffer = io.StringIO()
         writer = csv.writer(buffer, lineterminator="\n")
         writer.writerow(["event_id", "utc_time", "magnitude"])

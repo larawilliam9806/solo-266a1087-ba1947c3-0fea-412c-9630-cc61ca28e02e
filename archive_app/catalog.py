@@ -181,6 +181,20 @@ CREATE TABLE IF NOT EXISTS events (
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_events_day ON events(run_id, day);
+CREATE TABLE IF NOT EXISTS manifests (
+    run_id INTEGER PRIMARY KEY,
+    content TEXT NOT NULL,
+    filename TEXT,
+    registered_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS manifest_events (
+    run_id INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    PRIMARY KEY (run_id, event_id),
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+);
 """
 
 STATUS_PENDING = "pending"
@@ -408,11 +422,227 @@ class Store:
 
     def is_ready(self, run_id: int) -> bool:
         with self.connect() as conn:
-            bad = conn.execute(
-                "SELECT COUNT(*) FROM day_status WHERE run_id=? AND status!='complete'",
+            return self._is_ready(conn, run_id)
+
+    def _is_ready(self, conn: sqlite3.Connection, run_id: int) -> bool:
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM day_status WHERE run_id=? AND status!='complete'",
+            (run_id,),
+        ).fetchone()[0]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM day_status WHERE run_id=?", (run_id,)
+        ).fetchone()[0]
+        return total > 0 and bad == 0
+
+    # -- manifest -----------------------------------------------------
+
+    def set_manifest(
+        self, run_id: int, content: str, manifest: dict[str, str], filename: str | None
+    ) -> None:
+        """Register the immutable manifest snapshot for a fully checked run."""
+        now = dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self._lock, self.connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM manifests WHERE run_id=?", (run_id,)
+            ).fetchone():
+                raise ValueError("该任务已登记清单，固定清单不可替换")
+            rows = conn.execute(
+                "SELECT day FROM day_status WHERE run_id=?", (run_id,)
+            ).fetchall()
+            if not rows:
+                raise KeyError(run_id)
+            if not self._is_ready(conn, run_id):
+                raise ValueError("只有全部日期查全后才能登记清单")
+            known = {row["day"] for row in rows}
+            unknown = sorted({day for day in manifest.values() if day not in known})
+            if unknown:
+                raise ValueError("清单日期不在任务内: " + ", ".join(unknown))
+            try:
+                conn.execute(
+                    "INSERT INTO manifests(run_id, content, filename, registered_at) "
+                    "VALUES (?,?,?,?)",
+                    (run_id, content, filename, now),
+                )
+                conn.executemany(
+                    "INSERT INTO manifest_events(run_id, event_id, day) VALUES (?,?,?)",
+                    [(run_id, eid, day) for eid, day in manifest.items()],
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
+
+    def manifest(self, run_id: int) -> dict[str, str] | None:
+        """Return ``event_id -> day`` or ``None`` when nothing is registered."""
+        with self.connect() as conn:
+            meta = conn.execute(
+                "SELECT * FROM manifests WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if meta is None:
+                return None
+            rows = conn.execute(
+                "SELECT event_id, day FROM manifest_events WHERE run_id=?",
                 (run_id,),
-            ).fetchone()[0]
-            total = conn.execute(
-                "SELECT COUNT(*) FROM day_status WHERE run_id=?", (run_id,)
-            ).fetchone()[0]
-            return total > 0 and bad == 0
+            ).fetchall()
+        return {row["event_id"]: row["day"] for row in rows}
+
+    def manifest_meta(self, run_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM manifests WHERE run_id=?", (run_id,)
+            ).fetchone()
+
+    def _manifest_map(
+        self, conn: sqlite3.Connection, run_id: int
+    ) -> dict[str, str] | None:
+        meta = conn.execute(
+            "SELECT 1 FROM manifests WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if meta is None:
+            return None
+        return {
+            row["event_id"]: row["day"]
+            for row in conn.execute(
+                "SELECT event_id, day FROM manifest_events WHERE run_id=?", (run_id,)
+            )
+        }
+
+    def diff(self, run_id: int) -> "ManifestDiff | None":
+        with self.connect() as conn:
+            return self._diff_from_conn(conn, run_id)
+
+    def _diff_from_conn(
+        self, conn: sqlite3.Connection, run_id: int
+    ) -> "ManifestDiff | None":
+        from .manifest import build_diff
+
+        manifest = self._manifest_map(conn, run_id)
+        if manifest is None:
+            return None
+        days = [
+            row["day"]
+            for row in conn.execute(
+                "SELECT day FROM day_status WHERE run_id=? ORDER BY day", (run_id,)
+            )
+        ]
+        actual = [
+            (row["event_id"], row["day"])
+            for row in conn.execute(
+                "SELECT event_id, day FROM events WHERE run_id=?", (run_id,)
+            )
+        ]
+        return build_diff(manifest, actual, days)
+
+    def is_downloadable(self, run_id: int) -> bool:
+        """Every day complete, and -- if a manifest is registered -- no diff."""
+        with self.connect() as conn:
+            return self._is_downloadable(conn, run_id)
+
+    def snapshot_for_download(
+        self, run_id: int
+    ) -> tuple[sqlite3.Row | None, bool, list[sqlite3.Row]]:
+        """Read the run, readiness verdict and events in one transaction.
+
+        Using one connection keeps the verdict and the exported rows consistent
+        even if another request changes the archive concurrently.
+        """
+        with self._lock, self.connect() as conn:
+            conn.execute("BEGIN")
+            run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            ready = run is not None and self._is_downloadable(conn, run_id)
+            rows = (
+                conn.execute(
+                    "SELECT * FROM events WHERE run_id=? ORDER BY utc_time, event_id",
+                    (run_id,),
+                ).fetchall()
+                if ready
+                else []
+            )
+            conn.rollback()
+            return run, ready, rows
+
+    def _is_downloadable(self, conn: sqlite3.Connection, run_id: int) -> bool:
+        if not self._is_ready(conn, run_id):
+            return False
+        diff = self._diff_from_conn(conn, run_id)
+        return diff is None or not diff.has_differences
+
+    def collected_by_day(self, run_id: int) -> dict[str, list[Event]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT day, event_id, utc_time, magnitude FROM events "
+                "WHERE run_id=? ORDER BY utc_time, event_id",
+                (run_id,),
+            ).fetchall()
+        result: dict[str, list[Event]] = {}
+        for row in rows:
+            result.setdefault(row["day"], []).append(
+                Event(row["event_id"], row["utc_time"], row["magnitude"])
+            )
+        return result
+
+    def apply_corrections(
+        self,
+        run_id: int,
+        parsed: dict[str, list[Event]],
+    ) -> None:
+        """Atomically replace selected days' events with a full CSV upload.
+
+        Days may be cleared by uploading a file with headers only.  All selected
+        days are written in one transaction; any failure rolls back every row
+        and per-day count, leaving the previous state intact.
+        """
+        with self._lock, self.connect() as conn:
+            try:
+                day_rows = {
+                    row["day"]: row["status"]
+                    for row in conn.execute(
+                        "SELECT day, status FROM day_status WHERE run_id=?", (run_id,)
+                    )
+                }
+                for day in parsed:
+                    status = day_rows.get(day)
+                    if status is None:
+                        raise KeyError(day)
+                    if status not in (STATUS_COMPLETE, STATUS_BLOCKED):
+                        raise ValueError(f"{day} 尚未查全，不能按清单修正")
+                # Clear every selected day first: an event moving between days
+                # must not collide with its old row via the (run_id, event_id)
+                # primary key.
+                for day in parsed:
+                    conn.execute(
+                        "DELETE FROM events WHERE run_id=? AND day=?", (run_id, day)
+                    )
+                for day, events in parsed.items():
+                    for e in events:
+                        if e.utc_time[:10] != day:
+                            raise ValueError(f"事件 {e.event_id} 不在 {day}")
+                        try:
+                            conn.execute(
+                                "INSERT INTO events"
+                                "(run_id, day, event_id, utc_time, magnitude, source) "
+                                "VALUES (?,?,?,?,?,?)",
+                                (run_id, day, e.event_id, e.utc_time, e.magnitude, "csv"),
+                            )
+                        except sqlite3.IntegrityError as exc:
+                            raise ValueError(
+                                f"事件编号已被其他日期使用: {e.event_id}"
+                            ) from exc
+                    self._set_complete(conn, run_id, day)
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
+
+    @staticmethod
+    def _set_complete(conn: sqlite3.Connection, run_id: int, day: str) -> None:
+        """Mark a day complete and refresh its count (idempotent)."""
+        now = dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE run_id=? AND day=?", (run_id, day)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE day_status SET status=?, event_count=?, checked_at=?, last_error=NULL "
+            "WHERE run_id=? AND day=?",
+            (STATUS_COMPLETE, count, now, run_id, day),
+        )

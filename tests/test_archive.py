@@ -308,3 +308,436 @@ def test_web_events_listing_shows_required_fields(tmp_path):
     assert "Z1" in page
     assert "2024-01-01 03:04:00" in page
     assert "2.5" in page
+
+
+# ---------------------------------------------------------------------------
+# Network-issued manifest and partial corrections
+# ---------------------------------------------------------------------------
+
+
+def manifest_csv(pairs):
+    """pairs: iterable of (event_id, day)."""
+    rows = "event_id,day\n"
+    for event_id, day in pairs:
+        rows += f"{event_id},{day}\n"
+    return rows
+
+
+def register(client, run_id, content, filename="manifest.csv"):
+    return client.post(
+        f"/runs/{run_id}/manifest",
+        data={"csv": (io.BytesIO(content.encode("utf-8")), filename)},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+
+def correct(client, run_id, days, content, filename="corrected.csv"):
+    return client.post(
+        f"/runs/{run_id}/corrections",
+        data={
+            "days": list(days),
+            "csv": (io.BytesIO(content.encode("utf-8")), filename),
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+
+def event_rows(events):
+    rows = "event_id,utc_time,magnitude\n"
+    for event in events:
+        rows += f"{event['id']},{event['time'][:10]} {event['time'][11:19]},{event['magnitude']}\n"
+    return rows
+
+
+def collected_by_day(store, run_id):
+    result = {}
+    for row in store.events(run_id):
+        result.setdefault(row["day"], {})[row["event_id"]] = row
+    return result
+
+
+def test_manifest_parse_rules():
+    from archive_app.csv_import import parse_manifest
+
+    manifest = parse_manifest(manifest_csv([("A", "2024-01-02")]).encode(), "2024-01-01", "2024-01-03")
+    assert manifest == {"A": "2024-01-02"}
+
+    for bad, needle in [
+        (manifest_csv([("A", "2024-01-02"), ("A", "2024-01-03")]), "重复"),
+        (manifest_csv([("A", "2024-01-09")]), "不在任务"),
+        (manifest_csv([("A", "not-a-day")]), "无效"),
+    ]:
+        try:
+            parse_manifest(bad.encode(), "2024-01-01", "2024-01-03")
+        except CsvValidationError as exc:
+            assert any(needle in err for err in exc.errors), exc.errors
+        else:  # pragma: no cover
+            raise AssertionError("expected manifest rejection")
+
+
+def test_manifest_diff_classifies_missing_extra_and_wrong_day(tmp_path):
+    events = [
+        ev("OK", "2024-01-01"),
+        ev("WRONG", "2024-01-02"),  # manifest says 2024-01-03
+        ev("EXTRA", "2024-01-02"),  # not in manifest
+    ]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-04"})
+    client.post("/runs/1/collect")
+
+    page = register(
+        client,
+        1,
+        manifest_csv(
+            [
+                ("OK", "2024-01-01"),
+                ("WRONG", "2024-01-03"),
+                ("MISSING", "2024-01-04"),
+            ]
+        ),
+    ).get_data(as_text=True)
+
+    assert "台网签发事件清单" in page
+    # 2024-01-04 expects one event, is empty -> missing; 01-02 holds an unlisted
+    # (EXTRA) and a wrong-day (WRONG) record.
+    assert "漏项" in page and "多项" in page and "错日" in page
+    assert "MISSING" in page and "EXTRA" in page
+    assert "实存 2024-01-02 → 应归属 2024-01-03" in page
+
+    store = app.extensions["store"]
+    diff = store.diff(1)
+    assert diff.missing == (("MISSING", "2024-01-04"),)
+    assert diff.extra == (("EXTRA", "2024-01-02"),)
+    assert diff.wrong_day == (("WRONG", "2024-01-02", "2024-01-03"),)
+    assert diff.difference_days == {"2024-01-02", "2024-01-03", "2024-01-04"}
+
+    # A registered manifest with differences suspends the download.
+    assert client.get("/runs/1/download").status_code == 302
+
+
+def test_correction_batch_moves_wrong_day_adds_missing_and_drops_extra(tmp_path):
+    events = [
+        ev("OK", "2024-01-01"),
+        ev("WRONG", "2024-01-02"),
+        ev("EXTRA", "2024-01-02"),
+    ]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-04"})
+    client.post("/runs/1/collect")
+    register(
+        client,
+        1,
+        manifest_csv(
+            [("OK", "2024-01-01"), ("WRONG", "2024-01-03"), ("MISSING", "2024-01-04")]
+        ),
+    )
+
+    store = app.extensions["store"]
+    before_ok = dict(store.events(1, "2024-01-01")[0])
+
+    # WRONG moves 02 -> 03 with a new time on 03; MISSING is added on 04; 02
+    # becomes empty and is cleared by simply omitting it from the upload.  The
+    # already-correct 01-01 is not selected, so it is never rewritten.
+    rows = (
+        "event_id,utc_time,magnitude\n"
+        "WRONG,2024-01-03T05:00:00Z,3.0\n"
+        "MISSING,2024-01-04T06:00:00Z,3.0\n"
+    )
+    resp = correct(client, 1, ["2024-01-02", "2024-01-03", "2024-01-04"], rows)
+    text = resp.get_data(as_text=True)
+    assert "清单与归档完全一致" in text, text
+
+    diff = store.diff(1)
+    assert not diff.has_differences
+    by_day = collected_by_day(store, 1)
+    assert set(by_day["2024-01-01"]) == {"OK"}
+    assert "2024-01-02" not in by_day
+    assert set(by_day["2024-01-03"]) == {"WRONG"}
+    assert set(by_day["2024-01-04"]) == {"MISSING"}
+    # An already-correct event is preserved verbatim.
+    assert dict(store.events(1, "2024-01-01")[0]) == before_ok
+    # Full agreement re-enables the download.
+    assert client.get("/runs/1/download").status_code == 200
+
+
+def test_correction_requires_wrong_day_origins_and_targets_same_batch(tmp_path):
+    events = [ev("WRONG", "2024-01-02")]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-03"})
+    client.post("/runs/1/collect")
+    register(
+        client,
+        1,
+        manifest_csv([("WRONG", "2024-01-03")]),
+    )
+    store = app.extensions["store"]
+    before = [dict(r) for r in store.events(1)]
+
+    # Selecting only the target day leaves the old row behind -> rejected, no
+    # changes.
+    rows = "event_id,utc_time,magnitude\nWRONG,2024-01-03T05:00:00Z,3.0\n"
+    resp = correct(client, 1, ["2024-01-03"], rows)
+    text = resp.get_data(as_text=True)
+    assert "同一批" in text, text
+    assert [dict(r) for r in store.events(1)] == before
+
+    # Selecting both days succeeds.
+    resp = correct(client, 1, ["2024-01-02", "2024-01-03"], rows)
+    assert "清单与归档完全一致" in resp.get_data(as_text=True)
+    assert not store.diff(1).has_differences
+
+
+def test_correction_header_only_clears_selected_days(tmp_path):
+    events = [ev("A", "2024-01-01"), ev("B", "2024-01-02")]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-02"})
+    client.post("/runs/1/collect")
+    # Manifest expects an empty 2024-01-02, so the archive's B is extra.
+    register(client, 1, manifest_csv([("A", "2024-01-01")]))
+    store = app.extensions["store"]
+    assert store.diff(1).extra == (("B", "2024-01-02"),)
+
+    resp = correct(client, 1, ["2024-01-02"], "event_id,utc_time,magnitude\n")
+    assert "清单与归档完全一致" in resp.get_data(as_text=True)
+    assert store.events(1, "2024-01-02") == []
+    assert store.days(1)[1]["event_count"] == 0
+    assert store.days(1)[1]["status"] == STATUS_COMPLETE
+
+
+def test_correction_rejects_identifier_mismatch_and_preserves_state(tmp_path):
+    events = [ev("A", "2024-01-01")]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-02"})
+    client.post("/runs/1/collect")
+    register(client, 1, manifest_csv([("A", "2024-01-01"), ("B", "2024-01-02")]))
+    store = app.extensions["store"]
+    before = [dict(r) for r in store.events(1)]
+
+    # B is expected on 02 but the upload puts an unlisted X there instead.
+    rows = "event_id,utc_time,magnitude\nA,2024-01-01T00:00:00Z,3.0\nX,2024-01-02T00:00:00Z,3.0\n"
+    resp = correct(client, 1, ["2024-01-02"], rows)
+    text = resp.get_data(as_text=True)
+    assert "校验失败" in text and "B" in text and "X" in text, text
+    assert [dict(r) for r in store.events(1)] == before
+    # Download stays suspended (diff still present).
+    assert client.get("/runs/1/download").status_code == 302
+
+
+def test_correction_rejects_modified_already_correct_event(tmp_path):
+    events = [ev("A", "2024-01-01", 1, 0, 3.0)]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-02"})
+    client.post("/runs/1/collect")
+    register(client, 1, manifest_csv([("A", "2024-01-01"), ("B", "2024-01-02")]))
+    store = app.extensions["store"]
+    before = [dict(r) for r in store.events(1)]
+
+    rows = (
+        "event_id,utc_time,magnitude\n"
+        "A,2024-01-01T01:00:00Z,4.0\n"  # time and magnitude changed
+        "B,2024-01-02T00:00:00Z,3.0\n"
+    )
+    resp = correct(client, 1, ["2024-01-01", "2024-01-02"], rows)
+    text = resp.get_data(as_text=True)
+    assert "校验失败" in text and "被修改" in text, text
+    assert [dict(r) for r in store.events(1)] == before
+
+
+def test_partial_correction_keeps_download_paused_until_all_match(tmp_path):
+    events = [ev("A", "2024-01-01")]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-03"})
+    client.post("/runs/1/collect")
+    register(
+        client,
+        1,
+        manifest_csv([("A", "2024-01-01"), ("B", "2024-01-02"), ("C", "2024-01-03")]),
+    )
+    store = app.extensions["store"]
+
+    resp = correct(
+        client, 1, ["2024-01-02"],
+        "event_id,utc_time,magnitude\nB,2024-01-02T00:00:00Z,3.0\n",
+    )
+    assert "仍有差异" in resp.get_data(as_text=True)
+    assert store.diff(1).missing == (("C", "2024-01-03"),)
+    assert client.get("/runs/1/download").status_code == 302
+
+    resp = correct(
+        client, 1, ["2024-01-03"],
+        "event_id,utc_time,magnitude\nC,2024-01-03T00:00:00Z,3.0\n",
+    )
+    assert "清单与归档完全一致" in resp.get_data(as_text=True)
+    assert client.get("/runs/1/download").status_code == 200
+    out = client.get("/runs/1/download").get_data(as_text=True).strip().splitlines()
+    assert len(out) == 1 + 3
+    assert out[0] == "event_id,utc_time,magnitude"
+
+
+def test_correction_rejects_rows_outside_selected_days(tmp_path):
+    events = [ev("A", "2024-01-01"), ev("B", "2024-01-02")]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-03"})
+    client.post("/runs/1/collect")
+    register(
+        client, 1, manifest_csv([("A", "2024-01-01"), ("B", "2024-01-02"), ("C", "2024-01-03")])
+    )
+    store = app.extensions["store"]
+    before = [dict(r) for r in store.events(1)]
+
+    # Upload includes a row for 01-01 although only 01-03 was selected.
+    rows = (
+        "event_id,utc_time,magnitude\n"
+        "A,2024-01-01T00:00:00Z,3.0\n"
+        "C,2024-01-03T00:00:00Z,3.0\n"
+    )
+    resp = correct(client, 1, ["2024-01-03"], rows)
+    text = resp.get_data(as_text=True)
+    assert "未勾选" in text, text
+    assert [dict(r) for r in store.events(1)] == before
+
+
+def test_manifest_registration_is_validated_and_immutable(tmp_path):
+    events = [ev("A", "2024-01-01")]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-03"})
+    client.post("/runs/1/collect")
+    store = app.extensions["store"]
+
+    # Invalid manifest (day outside the run) leaves no snapshot behind.
+    resp = register(client, 1, manifest_csv([("A", "2024-02-01")]))
+    assert "清单校验失败" in resp.get_data(as_text=True)
+    assert store.manifest(1) is None
+
+    register(client, 1, manifest_csv([("A", "2024-01-01")]))
+    assert store.manifest(1) == {"A": "2024-01-01"}
+    assert not store.diff(1).has_differences
+
+    # The manifest is fixed once registered: a second upload is refused and the
+    # original snapshot is untouched.
+    resp = register(client, 1, manifest_csv([("A", "2024-01-02")]))
+    assert "不可替换" in resp.get_data(as_text=True)
+    assert store.manifest(1) == {"A": "2024-01-01"}
+    assert client.get("/runs/1/download").status_code == 200
+
+
+def test_manifest_registration_requires_all_days_checked(tmp_path):
+    events = [ev("A", "2024-01-01")]
+    path = write_catalog(tmp_path, events)
+    app = create_app(
+        database=str(tmp_path / "web.db"),
+        source=MockCatalogSource(path, fail_dates=["2024-01-02"]),
+        testing=True,
+    )
+    client = app.test_client()
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-02"})
+    client.post("/runs/1/collect")
+    store = app.extensions["store"]
+    assert statuses(store, 1)["2024-01-02"] == STATUS_FAILED
+
+    resp = register(client, 1, manifest_csv([("A", "2024-01-01")]))
+    assert "只有全部日期查全" in resp.get_data(as_text=True)
+    assert store.manifest(1) is None
+
+    # Once the failing day is retried successfully, registration is allowed.
+    app.extensions["source"] = MockCatalogSource(path)
+    client.post("/runs/1/collect")
+    resp = register(client, 1, manifest_csv([("A", "2024-01-01")]))
+    assert "与归档完全一致" in resp.get_data(as_text=True)
+    assert store.manifest(1) == {"A": "2024-01-01"}
+
+
+def test_download_uses_single_snapshot(tmp_path, monkeypatch):
+    events = [ev("A", "2024-01-01")]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-01"})
+    client.post("/runs/1/collect")
+    register(client, 1, manifest_csv([("A", "2024-01-01")]))
+    store = app.extensions["store"]
+    assert store.is_downloadable(1)
+
+    # The gating verdict and the exported rows come from one transaction; if
+    # the archive changes after the snapshot, the response still matches the
+    # verdict it made.  Here we force the verdict to be read once.
+    calls = {"n": 0}
+    real = store._is_downloadable
+
+    def counting(conn, run_id):
+        calls["n"] += 1
+        return real(conn, run_id)
+
+    monkeypatch.setattr(store, "_is_downloadable", counting)
+    resp = client.get("/runs/1/download")
+    assert resp.status_code == 200
+    assert calls["n"] == 1
+
+
+def test_correction_rejected_while_days_unchecked(tmp_path):
+    # A failed day means the run is not fully checked; corrections must not
+    # touch a partially collected archive, and no manifest can be registered
+    # yet, so the endpoint refuses before any write.
+    events = [ev("A", "2024-01-01")]
+    path = write_catalog(tmp_path, events)
+    app = create_app(
+        database=str(tmp_path / "web.db"),
+        source=MockCatalogSource(path, fail_dates=["2024-01-02"]),
+        testing=True,
+    )
+    client = app.test_client()
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-02"})
+    client.post("/runs/1/collect")
+    store = app.extensions["store"]
+
+    resp = correct(
+        client, 1, ["2024-01-01"],
+        "event_id,utc_time,magnitude\nA,2024-01-01T00:00:00Z,3.0\n",
+    )
+    assert "请先登记事件清单" in resp.get_data(as_text=True)
+    assert statuses(store, 1)["2024-01-02"] == STATUS_FAILED
+
+
+def test_manifest_page_lists_only_difference_days_for_selection(tmp_path):
+    events = [ev("A", "2024-01-01"), ev("B", "2024-01-02")]
+    client, _ = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-03"})
+    client.post("/runs/1/collect")
+    register(client, 1, manifest_csv([("A", "2024-01-01"), ("C", "2024-01-03")]))
+
+    page = register(client, 1, manifest_csv([("A", "2024-01-01")])).get_data(as_text=True)
+    # Manifest is fixed: second registration refused, existing one kept.
+    assert "不可替换" in page
+    page = client.get("/runs/1").get_data(as_text=True)
+    checkboxes = [
+        line for line in page.splitlines() if 'name="days"' in line
+    ]
+    # 01-01 matches; 01-02 has an extra B; 01-03 is missing C.
+    assert len(checkboxes) == 2
+    assert any("2024-01-02" in line for line in checkboxes)
+    assert any("2024-01-03" in line for line in checkboxes)
+    assert not any("2024-01-01" in line for line in checkboxes)
+
+
+def test_header_only_manifest_expects_zero_everywhere(tmp_path):
+    from archive_app.csv_import import parse_manifest
+
+    empty = parse_manifest(b"event_id,day\n", "2024-01-01", "2024-01-03")
+    assert empty == {}
+
+    events = [ev("A", "2024-01-01")]
+    client, app = make_client(tmp_path, events)
+    client.post("/runs", data={"start_date": "2024-01-01", "end_date": "2024-01-03"})
+    client.post("/runs/1/collect")
+    register(client, 1, "event_id,day\n")
+    store = app.extensions["store"]
+    diff = store.diff(1)
+    # The single archived event is now extra; every day expects zero.
+    assert diff.extra == (("A", "2024-01-01"),)
+    assert all(row.expected_count == 0 for row in diff.per_day)
+    assert client.get("/runs/1/download").status_code == 302
+
+    # Clearing 01-01 is enough to match a zero-expectation manifest.
+    resp = correct(client, 1, ["2024-01-01"], "event_id,utc_time,magnitude\n")
+    assert "清单与归档完全一致" in resp.get_data(as_text=True)
+    assert client.get("/runs/1/download").status_code == 200
